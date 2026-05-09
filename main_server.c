@@ -92,6 +92,25 @@ void print_client_list() {
     }
 }
 
+/* Checkpoint 1, Requirement 2: send a message 
+to all connected clients except sender. */
+void broadcast(int fromfd, char* message) {
+    pthread_mutex_lock(&list_lock);
+
+    USR* cur = head;
+
+    while (cur != NULL) {
+        if (cur->clisockfd != fromfd) {
+            int nsen = send(cur->clisockfd, message, strlen(message), 0);
+            if (nsen < 0) {
+                error("ERROR send() failed");
+            }
+        }
+        cur = cur->next;
+    }
+    pthread_mutex_unlock(&list_lock);
+} 
+
 typedef struct _ThreadArgs {
 	int clisockfd;
 } ThreadArgs;
@@ -122,6 +141,12 @@ void* thread_main(void* args)
 
     nrcv = recv(clisockfd, buffer, 255, 0);
     while (nrcv > 0) {
+        buffer[nrcv] = '\0';
+
+        /* C1, R2: broadcast message */
+        broadcast(clisockfd, buffer);
+        memset(buffer, 0, 256);
+
         nrcv = recv(clisockfd, buffer, 255, 0);
 		if (nrcv < 0) error("ERROR recv() failed");
 	}
