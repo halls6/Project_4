@@ -34,12 +34,12 @@ void* thread_main_receive(void* args)
     char buffer[512];
     int nrcv;
 
-    nrcv = recv(sockfd, buffer, 511, 0);
-    while (nrcv > 0) {
-        buffer[nrcv] = '\0';
-        printf("\n%s\n", buffer);
+    while (1) {
         memset(buffer, 0, 512);
         nrcv = recv(sockfd, buffer, 511, 0);
+        if (nrcv <= 0) { break; }
+        buffer[nrcv] = '\0';
+        printf("\n%s\n", buffer);
 	}
 
     return NULL;
@@ -61,16 +61,13 @@ void* thread_main_send(void* args) {
         memset(buffer, 0, 256);
         fgets(buffer, 255, stdin);
 
-        if (strlen(buffer) == 1) {
-            buffer[0] = '\0';
-        }
+        if (strlen(buffer) == 1) { break; }
+        buffer[strcspn(buffer, "\n")] = '\0';
 
         nsen = send(sockfd, buffer, strlen(buffer), 0);
         if (nsen < 0) {
             error("ERROR writing to socket");
         }
-
-        if (nsen == 0) { break; }
     }
 
     return NULL;

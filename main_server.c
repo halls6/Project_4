@@ -139,16 +139,12 @@ void* thread_main(void* args)
 	char buffer[256];
 	int nrcv;
 
-    nrcv = recv(clisockfd, buffer, 255, 0);
-    while (nrcv > 0) {
+    while ((nrcv = recv(clisockfd, buffer, 255, 0)) > 0) {
         buffer[nrcv] = '\0';
 
         /* C1, R2: broadcast message */
         broadcast(clisockfd, buffer);
         memset(buffer, 0, 256);
-
-        nrcv = recv(clisockfd, buffer, 255, 0);
-		if (nrcv < 0) error("ERROR recv() failed");
 	}
 
     /* client disconnect */
