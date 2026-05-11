@@ -10,6 +10,9 @@
 
 #define PORT_NUM 8080
 
+/* checkpoint 2: define rooms */
+#define MAX_ROOMS 10
+
 void error(const char *msg)
 {
     perror(msg);
@@ -24,35 +27,81 @@ typedef struct _USR {
     struct _USR* next;
 } USR;
 
-USR* head = NULL;
-pthread_mutex_t list_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct _ROOM {
+    int room_number;
+    int active;
+    USR* members;
+    pthread_mutex_t lock;
+} ROOM;
 
-void add_client(int clisockfd, char* ip) {
-    pthread_mutex_lock(&list_lock);
+ROOM rooms[MAX_ROOMS];
+int next_room_number = 1;
+pthread_mutex_t rooms_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void init_rooms() { /* C2: sets up rooms */
+    for (int i = 0; i < MAX_ROOMS; i++) {
+        rooms[i].room_number = 0;
+        rooms[i].active = 0;
+        rooms[i].members = NULL;
+        pthread_mutex_init(&rooms[i].lock, NULL);
+    }
+}
+
+/* C2: searches rooms and returns index of room with given num*/
+int find_room(int room_number) {
+    for (int i = 0; i < MAX_ROOMS; i++) {
+        if (rooms[i].active && rooms[i].room_number == room_number) {
+            return i;
+        }
+    }
+        return -1;
+ }
+
+ int create_room() { /* C2: marks first inactive room as active */
+    pthread_mutex_lock(&rooms_lock);
+    for (int i = 0; i < MAX_ROOMS; i++) {
+        if (!rooms[i].active) {
+            rooms[i].active = 1;
+            rooms[i].room_number = next_room_number++;
+            rooms[i].members = NULL;
+            pthread_mutex_unlock(&rooms_lock);
+            return i;
+        }
+    }
+
+    pthread_mutex_unlock(&rooms_lock);
+    return -1;
+
+ }
+
+ /* C2: replaces add_client function */
+ void room_add_client(int room_idx, int clisockfd, char* ip) {
+    pthread_mutex_lock(&rooms[room_idx].lock);
     USR* newuser = (USR*) malloc(sizeof(USR));
     newuser->clisockfd = clisockfd;
     strncpy(newuser->ip, ip, 32);
     strcpy(newuser->user, "unknown");
     newuser->next = NULL;
 
-    if (head == NULL) {
-        head = newuser;
+    if (rooms[room_idx].members == NULL) {
+        rooms[room_idx].members = newuser;
     } else {
-        USR* cur = head;
+        USR* cur = rooms[room_idx].members;
         while (cur->next != NULL) cur = cur->next;
         cur->next = newuser;
     }
-    pthread_mutex_unlock(&list_lock);
+    pthread_mutex_unlock(&rooms[room_idx].lock);
 }
 
-void remove_client(int clisockfd) {
-    pthread_mutex_lock(&list_lock);
-    USR* cur = head;
+/* C2: replaces remove_client function*/
+void room_remove_client(int room_idx, int clisockfd) {
+    pthread_mutex_lock(&rooms[room_idx].lock);
+    USR* cur = rooms[room_idx].members;
     USR* prev = NULL;
 
     while (cur != NULL) {
         if (cur->clisockfd == clisockfd) {
-            if (prev == NULL) head = cur->next;
+            if (prev == NULL) rooms[room_idx].members = cur->next;
             else prev->next = cur->next;
             free(cur);
             break;
@@ -60,22 +109,37 @@ void remove_client(int clisockfd) {
         prev = cur;
         cur = cur->next;
     }
-    pthread_mutex_unlock(&list_lock);
+
+    if (rooms[room_idx].members == NULL) {
+        rooms[room_idx].active = 0;
+        printf("Room %d is now empty and closed.\n", rooms[room_idx].room_number);
+    }
+    pthread_mutex_unlock(&rooms[room_idx].lock);
 }
 
 void print_client_list() {
     printf("Connected Clients:\n");
-    USR* cur = head;
-    if (cur == NULL) printf("No clients connected\n");
-    while (cur != NULL) {
-        printf(" %s (%s)\n", cur->user, cur->ip);
-        cur = cur->next;
+    int found = 0;
+    for (int i = 0; i < MAX_ROOMS; i++) {
+        if (rooms[i].active) {
+            USR* cur = rooms[i].members;
+            while (cur != NULL) {
+            printf(" [Room %d] %s (%s)\n", rooms[i].room_number, cur->user, cur->ip);
+            cur = cur->next;
+            found = 1;
+            }
+        }
+    }
+
+    if (!found) {
+        printf("No clients connected\n");
     }
 }
 
-void broadcast(int fromfd, char* message) {
-    pthread_mutex_lock(&list_lock);
-    USR* cur = head;
+/* C2: replaces broadcast function*/
+void room_broadcast(int room_idx, int fromfd, char* message) {
+    pthread_mutex_lock(&rooms[room_idx].lock);
+    USR* cur = rooms[room_idx].members;
     while (cur != NULL) {
         if (cur->clisockfd != fromfd) {
             int nsen = send(cur->clisockfd, message, strlen(message), 0);
@@ -83,11 +147,12 @@ void broadcast(int fromfd, char* message) {
         }
         cur = cur->next;
     }
-    pthread_mutex_unlock(&list_lock);
+    pthread_mutex_unlock(&rooms[room_idx].lock);
 }
 
 typedef struct _ThreadArgs {
     int clisockfd;
+    int room_idx; /* C2: add room_idx into thread args*/
 } ThreadArgs;
 
 void* thread_main(void* args)
@@ -95,6 +160,8 @@ void* thread_main(void* args)
     pthread_detach(pthread_self());
 
     int clisockfd = ((ThreadArgs*) args)->clisockfd;
+    /* C2: add room_idx into thread_main */
+    int room_idx = ((ThreadArgs*) args)->room_idx;
     free(args);
 
     /* get client IP address */
@@ -104,7 +171,7 @@ void* thread_main(void* args)
     char ip[32];
     strncpy(ip, inet_ntoa(cliaddr.sin_addr), 32);
 
-    add_client(clisockfd, ip);
+    room_add_client(room_idx, clisockfd, ip); /* C2: change name */
 
     /* Req 3: first message from client is their username */
     char username[64] = {0};
@@ -116,8 +183,8 @@ void* thread_main(void* args)
     if (nrcv > 0) {
         username[nrcv] = '\0';
         /* store in list */
-        pthread_mutex_lock(&list_lock);
-        USR* cur = head;
+        pthread_mutex_lock(&rooms[room_idx].lock);
+        USR* cur = rooms[room_idx].members;
         while (cur != NULL) {
             if (cur->clisockfd == clisockfd) {
                 strncpy(cur->user, username, 64);
@@ -125,7 +192,7 @@ void* thread_main(void* args)
             }
             cur = cur->next;
         }
-        pthread_mutex_unlock(&list_lock);
+        pthread_mutex_unlock(&rooms[room_idx].lock);
     }
 
     print_client_list();
@@ -133,26 +200,25 @@ void* thread_main(void* args)
     /* Req 4: broadcast join notification */
     char join_msg[128];
     snprintf(join_msg, sizeof(join_msg), "%s (%s) joined the chat room!\n", username, ip);
-    broadcast(clisockfd, join_msg);
+    room_broadcast(room_idx, clisockfd, join_msg);
 
     /* receive and broadcast messages */
     char buffer[256];
-    /* fix: increase formatted buffer to safely hold username+ip+message */
     char formatted[400];
 
     while ((nrcv = recv(clisockfd, buffer, 255, 0)) > 0) {
         buffer[nrcv] = '\0';
         snprintf(formatted, sizeof(formatted), "[%s (%s)] %s\n", username, ip, buffer);
-        broadcast(clisockfd, formatted);
+        room_broadcast(room_idx, clisockfd, formatted);
         memset(buffer, 0, 256);
     }
 
     /* Req 4: broadcast leave notification */
     char leave_msg[128];
     snprintf(leave_msg, sizeof(leave_msg), "%s (%s) left the room!\n", username, ip);
-    broadcast(clisockfd, leave_msg);
+    room_broadcast(room_idx, clisockfd, leave_msg);
 
-    remove_client(clisockfd);
+    room_remove_client(room_idx, clisockfd);
     print_client_list();
     close(clisockfd);
 
@@ -179,6 +245,7 @@ int main(int argc, char *argv[])
         error("ERROR on binding");
 
     listen(sockfd, 5);
+    init_rooms();
     printf("Server started on port %d\n", PORT_NUM);
 
     while (1) {
@@ -189,9 +256,46 @@ int main(int argc, char *argv[])
 
         printf("Connected: %s\n", inet_ntoa(cli_addr.sin_addr));
 
+        /* C2: */
+        char room_req[16] = {0};
+        char response[32] = {0};
+
+        int n = recv(newsockfd, room_req, 15, 0);
+        if(n <= 0) {
+            close(newsockfd);
+            continue;
+        }
+
+        room_req[n] = '\0';
+
+        int room_idx = -1;
+        if (strcmp(room_req, "new") == 0) {
+            room_idx = create_room();
+            if (room_idx < 0) {
+                send(newsockfd, "ERROR", 5, 0);
+                close(newsockfd);
+                continue;
+            }
+            snprintf(response, sizeof(response), "%d", rooms[room_idx].room_number);
+            send(newsockfd, response, strlen(response), 0);
+            printf("Created room %d\n", rooms[room_idx].room_number);
+        } 
+        else {
+            int room_number = atoi(room_req);
+            room_idx = find_room(room_number);
+            if (room_idx < 0)  {
+                send(newsockfd, "ERROR", 5, 0);
+                close(newsockfd);
+                continue;
+            }
+            snprintf(response, sizeof(response), "%d", room_number);
+            send(newsockfd, response, strlen(response), 0);
+            printf("Joined room %d\n", room_number);
+    }
         ThreadArgs* args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
         if (args == NULL) error("ERROR creating thread argument");
         args->clisockfd = newsockfd;
+        args->room_idx = room_idx;
 
         pthread_t tid;
         if (pthread_create(&tid, NULL, thread_main, (void*) args) != 0)

@@ -18,25 +18,25 @@ void error(const char *msg)
     exit(0);
 }
 
-/* Req 5: color codes */
+/* Req 5: ANSI color codes */
 const char* COLORS[] = {
-    "\033[31m",
-    "\033[32m",
-    "\033[33m",
-    "\033[34m",
-    "\033[35m",
-    "\033[36m",
-    "\033[91m",
-    "\033[92m",
-    "\033[93m",
-    "\033[94m",
-    "\033[95m",
-    "\033[96m",
+    "\033[31m",   /* red */
+    "\033[32m",   /* green */
+    "\033[33m",   /* yellow */
+    "\033[34m",   /* blue */
+    "\033[35m",   /* magenta */
+    "\033[36m",   /* cyan */
+    "\033[91m",   /* bright red */
+    "\033[92m",   /* bright green */
+    "\033[93m",   /* bright yellow */
+    "\033[94m",   /* bright blue */
+    "\033[95m",   /* bright magenta */
+    "\033[96m",   /* bright cyan */
 };
-
 #define NUM_COLORS 12
 #define RESET "\033[0m"
 
+/* Req 5: map usernames to colors */
 char color_names[MAX_USERS][64];
 int color_assigned[MAX_USERS];
 int num_colors_used = 0;
@@ -57,7 +57,6 @@ const char* get_color(const char* name) {
         strncpy(color_names[num_colors_used], name, 64);
         color_assigned[num_colors_used] = num_colors_used % NUM_COLORS;
         const char* c = COLORS[num_colors_used % NUM_COLORS];
-
         num_colors_used++;
         pthread_mutex_unlock(&color_lock);
         return c;
@@ -87,7 +86,7 @@ void* thread_main_receive(void* args)
         if (nrcv <= 0) break;
         buffer[nrcv] = '\0';
 
-        /* Req 5: parse sender name and colorize */
+        /* Req 5: parse sender name from "[Name (IP)] message" and colorize */
         if (buffer[0] == '[') {
             char name[64] = {0};
             char* start = buffer + 1;
@@ -102,7 +101,7 @@ void* thread_main_receive(void* args)
                 printf("\n%s\n", buffer);
             }
         } else {
-            /* system messages in default color */
+            /* system messages (join/leave) in default color */
             printf("\n%s\n", buffer);
         }
         fflush(stdout);
@@ -128,7 +127,8 @@ void* thread_main_send(void* args) {
 
         nsen = send(sockfd, buffer, strlen(buffer), 0);
         if (nsen < 0) {
-            error ("ERROR writing to socket");
+            perror("DEBUG send failed");
+            break; //error ("ERROR writing to socket");
         }
     }
 
@@ -137,7 +137,7 @@ void* thread_main_send(void* args) {
 
 int main(int argc, char *argv[])
 {
-    if (argc < 3) error("Please specify hostname and [new] or [room number]");
+    if (argc < 2) error("Please specify hostname");
 
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) error("ERROR opening socket");
@@ -154,27 +154,7 @@ int main(int argc, char *argv[])
     if (connect(sockfd, (struct sockaddr*) &serv_addr, slen) < 0)
         error("ERROR connecting");
 
-    send(sockfd, argv[2], strlen(argv[2]), 0);
-
-    char response[32] = {0};
-    int n = recv(sockfd, response, 31, 0);
-    if (n <= 0) {
-        error("ERROR receiving room response");
-    }
-
-    response[n] = '\0';
-
-    if (strcmp(response, "ERROR") == 0) {
-        printf("Room does not exist. \n");
-        close(sockfd);
-        return 0;
-    }
-
-    if (strcmp(argv[2], "new") == 0) {
-        printf("Connected to %s with new room number %s\n", argv[1], response);
-    } else {
-    printf("Connected to room %s\n", response);
-    }
+    printf("Connected to server\n");
 
     /* Req 3: prompt for username and send to server */
     char username[64];
@@ -196,7 +176,7 @@ int main(int argc, char *argv[])
     args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
     args->clisockfd = sockfd;
     pthread_create(&tid2, NULL, thread_main_receive, (void*) args);
-
+    
     pthread_join(tid1, NULL);
 
     close(sockfd);
