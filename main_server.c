@@ -157,7 +157,7 @@ void build_room_list(char* buf, int bufsize) {
             if (count == 1) {
                 snprintf(line, sizeof(line), "Room %d: 1 person\n", rooms[i].room_number);
             } else {
-                snprintf(line, sizeof(line), "Room %d: %d person\n", rooms[i].room_number, count);
+                snprintf(line, sizeof(line), "Room %d: %d people\n", rooms[i].room_number, count);
             }
 
             strncat(buf, line, bufsize - offset - 1);
