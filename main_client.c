@@ -5,7 +5,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <netdb.h> 
+#include <netdb.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 
@@ -23,14 +23,11 @@ typedef struct _ThreadArgs {
 
 void* thread_main_receive(void* args)
 {
-	// make sure thread resources are deallocated upon return
 	pthread_detach(pthread_self());
 
-	// get socket descriptor from argument
 	int sockfd = ((ThreadArgs*) args)->clisockfd;
 	free(args);
 
-    /* keep receiving and showing messages from server */
     char buffer[512];
     int nrcv;
 
@@ -46,14 +43,11 @@ void* thread_main_receive(void* args)
 }
 
 void* thread_main_send(void* args) {
-    // make sure thread resources are deallocated upon return
 	pthread_detach(pthread_self());
 
-	// get socket descriptor from argument
 	int sockfd = ((ThreadArgs*) args)->clisockfd;
 	free(args);
 
-    /* keep receiving and showing messages from server */
     char buffer[256];
     int nsen;
 
@@ -71,7 +65,6 @@ void* thread_main_send(void* args) {
     }
 
     return NULL;
-    
 }
 
 int main(int argc, char *argv[])
@@ -85,7 +78,7 @@ int main(int argc, char *argv[])
 	socklen_t slen = sizeof(serv_addr);
 	memset((char*) &serv_addr, 0, sizeof(serv_addr));
 	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_addr.s_addr = inet_addr(argv[1]);	
+	serv_addr.sin_addr.s_addr = inet_addr(argv[1]);
 	serv_addr.sin_port = htons(PORT_NUM);
 
     printf("Trying connecting to %s\n", inet_ntoa(serv_addr.sin_addr));
@@ -96,22 +89,29 @@ int main(int argc, char *argv[])
 
     printf("Connected to server\n");
 
-   pthread_t tid1;
-   pthread_t tid2;
-   ThreadArgs* args;
+    /* Req 3: prompt for username and send to server before spawning threads */
+    char username[64];
+    printf("Type your user name: ");
+    fflush(stdout);
+    fgets(username, 64, stdin);
+    username[strcspn(username, "\n")] = '\0';
+    send(sockfd, username, strlen(username), 0);
 
-   args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
-   args->clisockfd = sockfd;
-   pthread_create(&tid1, NULL, thread_main_send, (void*) args);
+    pthread_t tid1;
+    pthread_t tid2;
+    ThreadArgs* args;
 
-   args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
-   args->clisockfd = sockfd;
-   pthread_create(&tid2, NULL, thread_main_receive, (void*) args);
+    args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
+    args->clisockfd = sockfd;
+    pthread_create(&tid1, NULL, thread_main_send, (void*) args);
+
+    args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
+    args->clisockfd = sockfd;
+    pthread_create(&tid2, NULL, thread_main_receive, (void*) args);
 
     /* wait for send thread to finish */
     pthread_join(tid1, NULL);
 
     close(sockfd);
-	return 0; 
-
-    }
+	return 0;
+}

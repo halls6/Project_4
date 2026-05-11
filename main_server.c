@@ -43,7 +43,6 @@ void add_client(int clisockfd, char* ip) {
         while (cur->next != NULL) {
             cur = cur->next;
         }
-
         cur->next = newuser;
     }
 
@@ -60,16 +59,12 @@ void remove_client(int clisockfd) {
         if (cur->clisockfd == clisockfd) {
             if (prev == NULL) {
                 head = cur->next;
-            }
-
-            else {
+            } else {
                 prev->next = cur->next;
             }
-
             free(cur);
             break;
         }
-
         prev = cur;
         cur = cur->next;
     }
@@ -92,13 +87,11 @@ void print_client_list() {
     }
 }
 
-/* Checkpoint 1, Requirement 2: send a message 
-to all connected clients except sender. */
+/* send a message to all connected clients except sender */
 void broadcast(int fromfd, char* message) {
     pthread_mutex_lock(&list_lock);
 
     USR* cur = head;
-
     while (cur != NULL) {
         if (cur->clisockfd != fromfd) {
             int nsen = send(cur->clisockfd, message, strlen(message), 0);
@@ -109,7 +102,7 @@ void broadcast(int fromfd, char* message) {
         cur = cur->next;
     }
     pthread_mutex_unlock(&list_lock);
-} 
+}
 
 typedef struct _ThreadArgs {
 	int clisockfd;
@@ -117,10 +110,8 @@ typedef struct _ThreadArgs {
 
 void* thread_main(void* args)
 {
-	// make sure thread resources are deallocated upon return
 	pthread_detach(pthread_self());
 
-	// get socket descriptor from argument
 	int clisockfd = ((ThreadArgs*) args)->clisockfd;
 	free(args);
 
@@ -131,21 +122,52 @@ void* thread_main(void* args)
     char ip[32];
     strncpy(ip, inet_ntoa(cliaddr.sin_addr), 32);
 
-    /* add client to list and print updated list */
+    /* add client to list */
     add_client(clisockfd, ip);
+
+    /* Req 3: first message from client is their username */
+    char username[64] = "unknown";
+    int nrcv = recv(clisockfd, username, 63, 0);
+    if (nrcv > 0) {
+        username[nrcv] = '\0';
+
+        /* store username in the client list */
+        pthread_mutex_lock(&list_lock);
+        USR* cur = head;
+        while (cur != NULL) {
+            if (cur->clisockfd == clisockfd) {
+                strncpy(cur->user, username, 64);
+                break;
+            }
+            cur = cur->next;
+        }
+        pthread_mutex_unlock(&list_lock);
+    }
+
     print_client_list();
 
-    // Now, we receive/send messages
+    /* Req 4: broadcast join notification */
+    char join_msg[128];
+    snprintf(join_msg, sizeof(join_msg), "%s (%s) joined the chat room!", username, ip);
+    broadcast(clisockfd, join_msg);
+
+    /* receive and broadcast messages */
 	char buffer[256];
-	int nrcv;
 
     while ((nrcv = recv(clisockfd, buffer, 255, 0)) > 0) {
         buffer[nrcv] = '\0';
 
-        /* C1, R2: broadcast message */
-        broadcast(clisockfd, buffer);
+        /* format message with sender name and IP */
+        char formatted[320];
+        snprintf(formatted, sizeof(formatted), "[%s (%s)] %s", username, ip, buffer);
+        broadcast(clisockfd, formatted);
         memset(buffer, 0, 256);
 	}
+
+    /* Req 4: broadcast leave notification before removing */
+    char leave_msg[128];
+    snprintf(leave_msg, sizeof(leave_msg), "%s (%s) left the room!", username, ip);
+    broadcast(clisockfd, leave_msg);
 
     /* client disconnect */
     remove_client(clisockfd);
@@ -177,22 +199,19 @@ int main(int argc, char *argv[])
     while (1) {
         struct sockaddr_in cli_addr;
 		socklen_t clen = sizeof(cli_addr);
-		int newsockfd = accept(sockfd, 
-			(struct sockaddr *) &cli_addr, &clen);
+		int newsockfd = accept(sockfd, (struct sockaddr *) &cli_addr, &clen);
 		if (newsockfd < 0) error("ERROR on accept");
 
 		printf("Connected: %s\n", inet_ntoa(cli_addr.sin_addr));
 
-		// prepare ThreadArgs structure to pass client socket
 		ThreadArgs* args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
 		if (args == NULL) error("ERROR creating thread argument");
-		
 		args->clisockfd = newsockfd;
 
 		pthread_t tid;
-		if (pthread_create(&tid, NULL, thread_main, (void*) args) != 0) error("ERROR creating a new thread");
+		if (pthread_create(&tid, NULL, thread_main, (void*) args) != 0)
+            error("ERROR creating a new thread");
 	}
 
-	return 0; 
-
-    }
+	return 0;
+}
