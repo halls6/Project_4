@@ -135,8 +135,9 @@ void* thread_main_send(void* args) {
     return NULL;
 }
 
-int main(int argc, char *argv[]) {
-    if (argc < 2) error("Please specify hostname"); /* C3: updating argc check */
+int main(int argc, char *argv[])
+{
+    if (argc < 3) error("Please specify hostname and [new] or [room number]");
 
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) error("ERROR opening socket");
@@ -153,14 +154,10 @@ int main(int argc, char *argv[]) {
     if (connect(sockfd, (struct sockaddr*) &serv_addr, slen) < 0)
         error("ERROR connecting");
 
-    /* C3: a third new situation, send list to server */
-    if (argc == 3) {
     send(sockfd, argv[2], strlen(argv[2]), 0);
-    } else {
-        send(sockfd, "list", 4, 0);
-    }
-    char response[1024] = {0};
-    int n = recv(sockfd, response, 1023, 0);
+
+    char response[32] = {0};
+    int n = recv(sockfd, response, 31, 0);
     if (n <= 0) {
         error("ERROR receiving room response");
     }
@@ -173,44 +170,11 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    if (strncmp(response, "LIST", 4) == 0) {
-        printf("Server says the following options are available:\n");
-        printf("%s", response +5);
-        printf("Choose the room number or type [new] to create a new room: ");
-        fflush(stdout);
-
-        char choice[16] = {0};
-        fgets(choice, 15, stdin);
-        choice[strcspn(choice, "\n")] = '\0';
-        send(sockfd, choice, strlen(choice), 0);
-
-        memset(response, 0, 1024);
-        n = recv(sockfd, response, 1023, 0);
-        if (n <= 0) {
-            error("ERROR receiving room number");
-        }
-
-        response[n] = '\0';
-
-        if (strcmp(response, "ERROR") == 0) {
-            printf("Room does not exist. \n");
-            close(sockfd);
-            return 0;
-        }
-
-    printf("Connected to room %s\n", response);
-
-    } else if (strncmp(response, "NEW", 3) == 0) {
-        printf("Connected to %s with new room number %s\n", argv[1], response + 4);
-    }
-
-    else {
-    if (argc == 3 && strcmp(argv[2], "new") == 0) {
+    if (strcmp(argv[2], "new") == 0) {
         printf("Connected to %s with new room number %s\n", argv[1], response);
     } else {
     printf("Connected to room %s\n", response);
     }
-}
 
     /* Req 3: prompt for username and send to server */
     char username[64];

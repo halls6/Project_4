@@ -136,35 +136,6 @@ void print_client_list() {
     }
 }
 
-/* C3: builds string listing of all active rooms and members */
-void build_room_list(char* buf, int bufsize) {
-    memset(buf, 0, bufsize);
-    int offset = 0;
-
-    for (int i = 0; i < MAX_ROOMS; i++) {
-        if (rooms[i].active) {
-
-            /* counts members */
-            int count = 0;
-            USR* cur = rooms[i].members;
-
-            while (cur != NULL) {
-                count++;
-                cur = cur->next;
-            }
-
-            char line[64];
-            if (count == 1) {
-                snprintf(line, sizeof(line), "Room %d: 1 person\n", rooms[i].room_number);
-            } else {
-                snprintf(line, sizeof(line), "Room %d: %d person\n", rooms[i].room_number, count);
-            }
-
-            strncat(buf, line, bufsize - offset - 1);
-        }
-    }
-}
-
 /* C2: replaces broadcast function*/
 void room_broadcast(int room_idx, int fromfd, char* message) {
     pthread_mutex_lock(&rooms[room_idx].lock);
@@ -287,7 +258,7 @@ int main(int argc, char *argv[])
 
         /* C2: */
         char room_req[16] = {0};
-        char response[1024] = {0};
+        char response[32] = {0};
 
         int n = recv(newsockfd, room_req, 15, 0);
         if(n <= 0) {
@@ -297,8 +268,7 @@ int main(int argc, char *argv[])
 
         room_req[n] = '\0';
 
-int room_idx = -1;
-
+        int room_idx = -1;
         if (strcmp(room_req, "new") == 0) {
             room_idx = create_room();
             if (room_idx < 0) {
@@ -309,63 +279,11 @@ int room_idx = -1;
             snprintf(response, sizeof(response), "%d", rooms[room_idx].room_number);
             send(newsockfd, response, strlen(response), 0);
             printf("Created room %d\n", rooms[room_idx].room_number);
-
-        } else if (strcmp(room_req, "list") == 0) {
-            /* C3: check if any rooms exist */
-            int any_active = 0;
-            for (int i = 0; i < MAX_ROOMS; i++) {
-                if (rooms[i].active) { any_active = 1; break; }
-            }
-
-            if (!any_active) {
-                /* no rooms so create one */
-                room_idx = create_room();
-                char auto_msg[32];
-                snprintf(auto_msg, sizeof(auto_msg), "NEW %d", rooms[room_idx].room_number);
-                send(newsockfd, auto_msg, strlen(auto_msg), 0);
-                printf("Auto created room %d\n", rooms[room_idx].room_number);
-            } else {
-                /* send list to client */
-                char list_buf[1024] = "LIST\n";
-                char room_list[900] = {0};
-                build_room_list(room_list, 900);
-                strncat(list_buf, room_list, sizeof(list_buf) - 6);
-                send(newsockfd, list_buf, strlen(list_buf), 0);
-
-                /* wait for clients choice */
-                char choice[16] = {0};
-                int cn = recv(newsockfd, choice, 15, 0);
-                if (cn <= 0) { close(newsockfd); continue; }
-                choice[cn] = '\0';
-
-                if (strcmp(choice, "new") == 0) {
-                    room_idx = create_room();
-                    if (room_idx < 0) {
-                        send(newsockfd, "ERROR", 5, 0);
-                        close(newsockfd);
-                        continue;
-                    }
-                    snprintf(response, sizeof(response), "%d", rooms[room_idx].room_number);
-                    send(newsockfd, response, strlen(response), 0);
-                    printf("Created room %d\n", rooms[room_idx].room_number);
-                } else {
-                    int room_number = atoi(choice);
-                    room_idx = find_room(room_number);
-                    if (room_idx < 0) {
-                        send(newsockfd, "ERROR", 5, 0);
-                        close(newsockfd);
-                        continue;
-                    }
-                    snprintf(response, sizeof(response), "%d", room_number);
-                    send(newsockfd, response, strlen(response), 0);
-                    printf("Joined room %d\n", room_number);
-                }
-            }
-
-        } else {
+        } 
+        else {
             int room_number = atoi(room_req);
             room_idx = find_room(room_number);
-            if (room_idx < 0) {
+            if (room_idx < 0)  {
                 send(newsockfd, "ERROR", 5, 0);
                 close(newsockfd);
                 continue;
@@ -373,7 +291,7 @@ int room_idx = -1;
             snprintf(response, sizeof(response), "%d", room_number);
             send(newsockfd, response, strlen(response), 0);
             printf("Joined room %d\n", room_number);
-        }
+    }
         ThreadArgs* args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
         if (args == NULL) error("ERROR creating thread argument");
         args->clisockfd = newsockfd;
