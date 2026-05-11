@@ -107,8 +107,12 @@ void* thread_main(void* args)
     add_client(clisockfd, ip);
 
     /* Req 3: first message from client is their username */
-    char username[64] = "unknown";
-    int nrcv = recv(clisockfd, username, 63, 0);
+    char username[64] = {0};
+    int nrcv;
+    do {
+        nrcv = recv(clisockfd, username, 63, 0);
+    } while (nrcv == 0);
+
     if (nrcv > 0) {
         username[nrcv] = '\0';
         /* store in list */
@@ -159,6 +163,10 @@ int main(int argc, char *argv[])
 {
     int sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd < 0) error("ERROR opening socket");
+
+    /* allows reuse of port immediately */
+    int opt = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in serv_addr;
     socklen_t slen = sizeof(serv_addr);

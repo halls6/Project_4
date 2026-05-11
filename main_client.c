@@ -111,7 +111,6 @@ void* thread_main_receive(void* args)
 }
 
 void* thread_main_send(void* args) {
-    pthread_detach(pthread_self());
 
     int sockfd = ((ThreadArgs*) args)->clisockfd;
     free(args);
@@ -123,11 +122,14 @@ void* thread_main_send(void* args) {
         memset(buffer, 0, 256);
         fgets(buffer, 255, stdin);
 
-        if (strlen(buffer) == 1) break;
+        if (strlen(buffer) == 1 && buffer[0] == '\n') break;
         buffer[strcspn(buffer, "\n")] = '\0';
 
         nsen = send(sockfd, buffer, strlen(buffer), 0);
-        if (nsen < 0) error("ERROR writing to socket");
+        if (nsen < 0) {
+            perror("DEBUG send failed");
+            break; //error ("ERROR writing to socket");
+        }
     }
 
     return NULL;
@@ -159,11 +161,9 @@ int main(int argc, char *argv[])
     printf("Type your user name: ");
     fflush(stdout);
     /* scanf reads the name and stops before the newline */
-    scanf("%63s", username);
-    /* fix: drain the leftover newline so thread_main_send doesn't read it */
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF);
-    send(sockfd, username, strlen(username), 0);
+   fgets(username, 63, stdin);
+   username[strcspn(username, "\n")] = '\0';
+   send(sockfd, username, strlen(username), 0);
 
     pthread_t tid1;
     pthread_t tid2;
@@ -176,7 +176,7 @@ int main(int argc, char *argv[])
     args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
     args->clisockfd = sockfd;
     pthread_create(&tid2, NULL, thread_main_receive, (void*) args);
-
+    
     pthread_join(tid1, NULL);
 
     close(sockfd);
