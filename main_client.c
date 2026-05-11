@@ -61,7 +61,7 @@ void* thread_main_send(void* args) {
         memset(buffer, 0, 256);
         fgets(buffer, 255, stdin);
 
-        if (strlen(buffer) == 1) { break; }
+        if (strlen(buffer) == 0 || (strlen(buffer) == 1 && buffer[0] == '\n')) { break; }
         buffer[strcspn(buffer, "\n")] = '\0';
 
         nsen = send(sockfd, buffer, strlen(buffer), 0);
@@ -95,6 +95,18 @@ int main(int argc, char *argv[])
     }
 
     printf("Connected to server\n");
+
+    /* checkpoint 1, requirement 3: usernames */
+    char user[64];
+    printf("Type your user name: ");
+    fflush(stdout);
+    memset(user, 0, 64);
+    fgets(user, 63, stdin);
+    user[strcspn(user, "\n")] = '\0';
+    send(sockfd, user, strlen(user), 0);
+
+    sleep(1);
+
 
    pthread_t tid1;
    pthread_t tid2;

@@ -97,11 +97,30 @@ to all connected clients except sender. */
 void broadcast(int fromfd, char* message) {
     pthread_mutex_lock(&list_lock);
 
+    /* C1, R3: find sender's username and ip */
+    char username[64] = "unknown";
+    char ip[32] = "unknown";
     USR* cur = head;
 
     while (cur != NULL) {
+        if (cur->clisockfd == fromfd) {
+            strncpy(username, cur->user, 64);
+            strncpy(ip, cur->ip, 32);
+            break;
+            }
+        
+        cur = cur->next;
+        }
+
+        cur = head; 
+
+        /* send to all clients except sender */
+        char formatted[512];
+        snprintf(formatted, 512, "[%s (%s)] %s", username, ip, message);
+
+    while (cur != NULL) {
         if (cur->clisockfd != fromfd) {
-            int nsen = send(cur->clisockfd, message, strlen(message), 0);
+            int nsen = send(cur->clisockfd, formatted, strlen(formatted), 0);
             if (nsen < 0) {
                 error("ERROR send() failed");
             }
@@ -131,13 +150,37 @@ void* thread_main(void* args)
     char ip[32];
     strncpy(ip, inet_ntoa(cliaddr.sin_addr), 32);
 
-    /* add client to list and print updated list */
+    /* add client to list */
     add_client(clisockfd, ip);
-    print_client_list();
+
+    /* checkpoint 1, req3: get username */
+    char username[64];
+    memset(username, 0, 64);
+
+    int nrcv = recv(clisockfd, username, 63, 0);
+    if (nrcv > 0) {
+        username[nrcv] = '\0';
+
+        /* store username */
+        pthread_mutex_lock(&list_lock);
+        USR* cur = head;
+
+        
+        while (cur != NULL) {
+            if (cur->clisockfd == clisockfd) {
+                strncpy(cur->user, username, 64);
+                break;
+            }
+            cur = cur->next;
+        }
+
+        pthread_mutex_unlock(&list_lock);
+        /* print updated list */
+        print_client_list();
+    }
 
     // Now, we receive/send messages
 	char buffer[256];
-	int nrcv;
 
     while ((nrcv = recv(clisockfd, buffer, 255, 0)) > 0) {
         buffer[nrcv] = '\0';
