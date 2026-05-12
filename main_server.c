@@ -2,201 +2,539 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/types.h> 
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <libssh/libssh.h>
+#include <libssh/server.h>
 
-#define PORT_NUM 8080
+// ports
+#define SSH_PORT      2222   // EXTRA 1: clients SSH into this port
+#define INTERNAL_PORT 8081   // chat logic; bound to 127.0.0.1 only
 
-void error(const char *msg)
-{
-	perror(msg);
-	exit(1);
-}
+// limits
+#define MAX_ROOMS 10
 
-/* represent each connected client */
+// SSH host key (generated automatically on first run)
+#define HOSTKEY_PATH "/tmp/chat_hostkey_rsa"
+
+/* Data structures */
+
+void error(const char *msg) { perror(msg); exit(1); }
+
+// One connected chat user
 typedef struct _USR {
-    int clisockfd;
-    char user[64];
-    char ip[32];
-    struct _USR* next;
+    int          clisockfd;
+    char         user[64];
+    char         ip[32];
+    struct _USR *next;
 } USR;
 
-USR* head = NULL;
-pthread_mutex_t list_lock = PTHREAD_MUTEX_INITIALIZER;
+// One chat room
+typedef struct _ROOM {
+    int             room_number;
+    int             active;
+    USR            *members;
+    pthread_mutex_t lock;
+} ROOM;
 
-/* add a new client to the list */
-void add_client(int clisockfd, char* ip) {
-    pthread_mutex_lock(&list_lock);
-    USR* newuser = (USR*) malloc(sizeof(USR));
-    newuser->clisockfd = clisockfd;
-    strncpy(newuser->ip, ip, 32);
-    strcpy(newuser->user, "unknown");
-    newuser->next = NULL;
+ROOM rooms[MAX_ROOMS];
+int  next_room_number = 1;
+pthread_mutex_t rooms_lock = PTHREAD_MUTEX_INITIALIZER;
 
-    if (head == NULL) {
-        head = newuser;
-    } else {
-        USR* cur = head;
-        while (cur->next != NULL) {
-            cur = cur->next;
-        }
+/* Room management helpers */
 
-        cur->next = newuser;
+// C2: initialise rooms array
+void init_rooms(void) {
+    for (int i = 0; i < MAX_ROOMS; i++) {
+        rooms[i].room_number = 0;
+        rooms[i].active      = 0;
+        rooms[i].members     = NULL;
+        pthread_mutex_init(&rooms[i].lock, NULL);
     }
-
-    pthread_mutex_unlock(&list_lock);
 }
 
-void remove_client(int clisockfd) {
-    pthread_mutex_lock(&list_lock);
+// C2: find a room by room_number; returns slot index or -1
+int find_room(int room_number) {
+    for (int i = 0; i < MAX_ROOMS; i++)
+        if (rooms[i].active && rooms[i].room_number == room_number)
+            return i;
+    return -1;
+}
 
-    USR* cur = head;
-    USR* prev = NULL;
+// C2: mark first inactive slot as a new room
+int create_room(void) {
+    pthread_mutex_lock(&rooms_lock);
+    for (int i = 0; i < MAX_ROOMS; i++) {
+        if (!rooms[i].active) {
+            rooms[i].active      = 1;
+            rooms[i].room_number = next_room_number++;
+            rooms[i].members     = NULL;
+            pthread_mutex_unlock(&rooms_lock);
+            return i;
+        }
+    }
+    pthread_mutex_unlock(&rooms_lock);
+    return -1;
+}
 
-    while (cur != NULL) {
+// C2: add a new client to a room
+void room_add_client(int room_idx, int clisockfd, char *ip) {
+    pthread_mutex_lock(&rooms[room_idx].lock);
+    USR *u = malloc(sizeof(USR));
+    u->clisockfd = clisockfd;
+    strncpy(u->ip, ip, 32);
+    strcpy(u->user, "unknown");
+    u->next = NULL;
+    if (!rooms[room_idx].members) {
+        rooms[room_idx].members = u;
+    } else {
+        USR *cur = rooms[room_idx].members;
+        while (cur->next) cur = cur->next;
+        cur->next = u;
+    }
+    pthread_mutex_unlock(&rooms[room_idx].lock);
+}
+
+// C2: remove a client from a room; close room if empty 
+void room_remove_client(int room_idx, int clisockfd) {
+    pthread_mutex_lock(&rooms[room_idx].lock);
+    USR *cur = rooms[room_idx].members, *prev = NULL;
+    while (cur) {
         if (cur->clisockfd == clisockfd) {
-            if (prev == NULL) {
-                head = cur->next;
-            }
-
-            else {
-                prev->next = cur->next;
-            }
-
+            if (!prev) rooms[room_idx].members = cur->next;
+            else       prev->next = cur->next;
             free(cur);
             break;
         }
-
-        prev = cur;
-        cur = cur->next;
+        prev = cur; cur = cur->next;
     }
-
-    pthread_mutex_unlock(&list_lock);
+    if (!rooms[room_idx].members) {
+        rooms[room_idx].active = 0;
+        printf("Room %d is now empty and closed.\n", rooms[room_idx].room_number);
+    }
+    pthread_mutex_unlock(&rooms[room_idx].lock);
 }
 
-/* print the current list of clients */
-void print_client_list() {
+// Print all connected clients to the server terminal
+void print_client_list(void) {
     printf("Connected Clients:\n");
-    USR* cur = head;
-
-    if (cur == NULL) {
-        printf("No clients connected\n");
-    }
-
-    while (cur != NULL) {
-        printf(" %s (%s)\n", cur->user, cur->ip);
-        cur = cur->next;
-    }
-}
-
-/* Checkpoint 1, Requirement 2: send a message 
-to all connected clients except sender. */
-void broadcast(int fromfd, char* message) {
-    pthread_mutex_lock(&list_lock);
-
-    USR* cur = head;
-
-    while (cur != NULL) {
-        if (cur->clisockfd != fromfd) {
-            int nsen = send(cur->clisockfd, message, strlen(message), 0);
-            if (nsen < 0) {
-                error("ERROR send() failed");
+    int found = 0;
+    for (int i = 0; i < MAX_ROOMS; i++) {
+        if (rooms[i].active) {
+            for (USR *cur = rooms[i].members; cur; cur = cur->next) {
+                printf(" [Room %d] %s (%s)\n",
+                       rooms[i].room_number, cur->user, cur->ip);
+                found = 1;
             }
         }
-        cur = cur->next;
     }
-    pthread_mutex_unlock(&list_lock);
-} 
+    if (!found) printf("No clients connected\n");
+}
+
+// C3: build a human-readable room list into buf
+void build_room_list(char *buf, int bufsize) {
+    memset(buf, 0, bufsize);
+    int offset = 0;
+    for (int i = 0; i < MAX_ROOMS; i++) {
+        if (rooms[i].active) {
+            int count = 0;
+            for (USR *c = rooms[i].members; c; c = c->next) count++;
+            char line[64];
+            if (count == 1)
+                snprintf(line, sizeof(line), "Room %d: 1 person\n",  rooms[i].room_number);
+            else
+                snprintf(line, sizeof(line), "Room %d: %d people\n", rooms[i].room_number, count);
+            strncat(buf, line, bufsize - offset - 1);
+            offset += strlen(line);
+        }
+    }
+}
+
+// C2: broadcast a message to all room members except the sender
+void room_broadcast(int room_idx, int fromfd, char *message) {
+    pthread_mutex_lock(&rooms[room_idx].lock);
+    for (USR *cur = rooms[room_idx].members; cur; cur = cur->next)
+        if (cur->clisockfd != fromfd)
+            send(cur->clisockfd, message, strlen(message), 0);
+    pthread_mutex_unlock(&rooms[room_idx].lock);
+}
+
+/* Per-client chat thread */
 
 typedef struct _ThreadArgs {
-	int clisockfd;
+    int clisockfd;
+    int room_idx;   /* C2 */
 } ThreadArgs;
 
-void* thread_main(void* args)
-{
-	// make sure thread resources are deallocated upon return
-	pthread_detach(pthread_self());
+void *thread_main(void *args) {
+    pthread_detach(pthread_self());
 
-	// get socket descriptor from argument
-	int clisockfd = ((ThreadArgs*) args)->clisockfd;
-	free(args);
+    int clisockfd = ((ThreadArgs *)args)->clisockfd;
+    int room_idx  = ((ThreadArgs *)args)->room_idx;
+    free(args);
 
-    /* get client IP address */
+    // get client IP
     struct sockaddr_in cliaddr;
     socklen_t clen = sizeof(cliaddr);
-    getpeername(clisockfd, (struct sockaddr*)&cliaddr, &clen);
+    getpeername(clisockfd, (struct sockaddr *)&cliaddr, &clen);
     char ip[32];
     strncpy(ip, inet_ntoa(cliaddr.sin_addr), 32);
 
-    /* add client to list and print updated list */
-    add_client(clisockfd, ip);
+    room_add_client(room_idx, clisockfd, ip);  /* C2 */
+
+    // Req 3: first recv is the username
+    char username[64] = {0};
+    int nrcv;
+    do { nrcv = recv(clisockfd, username, 63, 0); } while (nrcv == 0);
+    if (nrcv > 0) {
+        username[nrcv] = '\0';
+        pthread_mutex_lock(&rooms[room_idx].lock);
+        for (USR *c = rooms[room_idx].members; c; c = c->next)
+            if (c->clisockfd == clisockfd) { strncpy(c->user, username, 64); break; }
+        pthread_mutex_unlock(&rooms[room_idx].lock);
+    }
+
     print_client_list();
 
-    // Now, we receive/send messages
-	char buffer[256];
-	int nrcv;
+    // Req 4: broadcast join notification
+    char join_msg[128];
+    snprintf(join_msg, sizeof(join_msg),
+             "%s (%s) joined the chat room!\n", username, ip);
+    room_broadcast(room_idx, clisockfd, join_msg);
 
-    nrcv = recv(clisockfd, buffer, 255, 0);
-    while (nrcv > 0) {
+    // main recv / broadcast loop
+    char buffer[256];
+    char formatted[400];
+
+    while ((nrcv = recv(clisockfd, buffer, 255, 0)) > 0) {
         buffer[nrcv] = '\0';
+        snprintf(formatted, sizeof(formatted),
+                 "[%s (%s)] %s\n", username, ip, buffer);
+        room_broadcast(room_idx, clisockfd, formatted);
+        memset(buffer, 0, sizeof(buffer));
+    }
 
-        /* C1, R2: broadcast message */
-        broadcast(clisockfd, buffer);
-        memset(buffer, 0, 256);
+    // Req 4: broadcast leave notification
+    char leave_msg[128];
+    snprintf(leave_msg, sizeof(leave_msg),
+             "%s (%s) left the room!\n", username, ip);
+    room_broadcast(room_idx, clisockfd, leave_msg);
 
-        nrcv = recv(clisockfd, buffer, 255, 0);
-		if (nrcv < 0) error("ERROR recv() failed");
-	}
-
-    /* client disconnect */
-    remove_client(clisockfd);
+    room_remove_client(room_idx, clisockfd);
     print_client_list();
     close(clisockfd);
-
     return NULL;
 }
 
-int main(int argc, char *argv[])
-{
-	int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	if (sockfd < 0) error("ERROR opening socket");
+/* Internal chat listener (127.0.0.1:INTERNAL_PORT) */
+/* Accepts TCP connections forwarded from the SSH channel bridge. */
 
-	struct sockaddr_in serv_addr;
-	socklen_t slen = sizeof(serv_addr);
-	memset((char*) &serv_addr, 0, sizeof(serv_addr));
-	serv_addr.sin_family = AF_INET;
-	serv_addr.sin_addr.s_addr = INADDR_ANY;	
-	serv_addr.sin_port = htons(PORT_NUM);
+// C2/C3: room negotiation on a freshly-accepted internal socket
+void handle_room_negotiation(int newsockfd) {
+    char room_req[16] = {0}, response[1024] = {0};
+    int n = recv(newsockfd, room_req, 15, 0);
+    if (n <= 0) { close(newsockfd); return; }
+    room_req[n] = '\0';
 
-    if (bind(sockfd, (struct sockaddr*) &serv_addr, slen) < 0) {
-        error("ERROR on binding");
+    int room_idx = -1;
+
+    if (strcmp(room_req, "new") == 0) {
+        // C2: create new room
+        room_idx = create_room();
+        if (room_idx < 0) { send(newsockfd, "ERROR", 5, 0); close(newsockfd); return; }
+        snprintf(response, sizeof(response), "%d", rooms[room_idx].room_number);
+        send(newsockfd, response, strlen(response), 0);
+        printf("Created room %d\n", rooms[room_idx].room_number);
+
+    } else if (strcmp(room_req, "list") == 0) {
+        // C3: send list or auto-create
+        int any = 0;
+        for (int i = 0; i < MAX_ROOMS; i++) if (rooms[i].active) { any = 1; break; }
+
+        if (!any) {
+            room_idx = create_room();
+            char auto_msg[32];
+            snprintf(auto_msg, sizeof(auto_msg), "NEW %d", rooms[room_idx].room_number);
+            send(newsockfd, auto_msg, strlen(auto_msg), 0);
+            printf("Auto created room %d\n", rooms[room_idx].room_number);
+        } else {
+            char list_buf[1024] = "LIST\n", room_list[900] = {0};
+            build_room_list(room_list, 900);
+            strncat(list_buf, room_list, sizeof(list_buf) - 6);
+            send(newsockfd, list_buf, strlen(list_buf), 0);
+
+            char choice[16] = {0};
+            int cn = recv(newsockfd, choice, 15, 0);
+            if (cn <= 0) { close(newsockfd); return; }
+            choice[cn] = '\0';
+
+            if (strcmp(choice, "new") == 0) {
+                room_idx = create_room();
+                if (room_idx < 0) { send(newsockfd, "ERROR", 5, 0); close(newsockfd); return; }
+                snprintf(response, sizeof(response), "%d", rooms[room_idx].room_number);
+                send(newsockfd, response, strlen(response), 0);
+                printf("Created room %d\n", rooms[room_idx].room_number);
+            } else {
+                int rn = atoi(choice);
+                room_idx = find_room(rn);
+                if (room_idx < 0) { send(newsockfd, "ERROR", 5, 0); close(newsockfd); return; }
+                snprintf(response, sizeof(response), "%d", rn);
+                send(newsockfd, response, strlen(response), 0);
+                printf("Joined room %d\n", rn);
+            }
+        }
+    } else {
+        // C2: join by room number
+        int rn = atoi(room_req);
+        room_idx = find_room(rn);
+        if (room_idx < 0) { send(newsockfd, "ERROR", 5, 0); close(newsockfd); return; }
+        snprintf(response, sizeof(response), "%d", rn);
+        send(newsockfd, response, strlen(response), 0);
+        printf("Joined room %d\n", rn);
     }
 
-    listen(sockfd, 5);
-    printf("Server started on port %d\n", PORT_NUM);
+    ThreadArgs *ta = malloc(sizeof(ThreadArgs));
+    if (!ta) error("ERROR malloc thread args");
+    ta->clisockfd = newsockfd;
+    ta->room_idx  = room_idx;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, thread_main, ta) != 0)
+        error("ERROR creating per-client thread");
+}
+
+// EXTRA 1: background thread running the internal TCP listener
+void *internal_listener_thread(void *arg) {
+    (void)arg;
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) error("ERROR opening internal socket");
+    int opt = 1;
+    setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1");   // loopback only
+    addr.sin_port        = htons(INTERNAL_PORT);
+
+    if (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+        error("ERROR binding internal socket");
+    listen(sockfd, 10);
+    printf("Internal chat listener on 127.0.0.1:%d\n", INTERNAL_PORT);
 
     while (1) {
-        struct sockaddr_in cli_addr;
-		socklen_t clen = sizeof(cli_addr);
-		int newsockfd = accept(sockfd, 
-			(struct sockaddr *) &cli_addr, &clen);
-		if (newsockfd < 0) error("ERROR on accept");
-
-		printf("Connected: %s\n", inet_ntoa(cli_addr.sin_addr));
-
-		// prepare ThreadArgs structure to pass client socket
-		ThreadArgs* args = (ThreadArgs*) malloc(sizeof(ThreadArgs));
-		if (args == NULL) error("ERROR creating thread argument");
-		
-		args->clisockfd = newsockfd;
-
-		pthread_t tid;
-		if (pthread_create(&tid, NULL, thread_main, (void*) args) != 0) error("ERROR creating a new thread");
-	}
-
-	return 0; 
-
+        struct sockaddr_in cli; socklen_t cl = sizeof(cli);
+        int newsock = accept(sockfd, (struct sockaddr *)&cli, &cl);
+        if (newsock < 0) continue;
+        printf("Connected (internal): %s\n", inet_ntoa(cli.sin_addr));
+        handle_room_negotiation(newsock);
     }
+    return NULL;
+}
+
+/* EXTRA 1 – libssh server: SSH channel bridge */
+typedef struct {
+    ssh_channel      channel;
+    int              sockfd;
+    int             *done;
+    pthread_mutex_t *done_lock;
+} BridgeArgs;
+
+// EXTRA 1: forward bytes from SSH channel into the internal socket
+void *bridge_ch_to_sock(void *arg) {
+    BridgeArgs *a = (BridgeArgs *)arg;
+    char buf[4096];
+    while (1) {
+        pthread_mutex_lock(a->done_lock);
+        int d = *a->done; pthread_mutex_unlock(a->done_lock);
+        if (d) break;
+
+        int n = ssh_channel_read_timeout(a->channel, buf, sizeof(buf), 0, 200);
+        if (n == SSH_ERROR) break;
+        if (n == 0) { if (ssh_channel_is_eof(a->channel)) break; continue; }
+
+        int sent = 0;
+        while (sent < n) {
+            int w = send(a->sockfd, buf + sent, n - sent, 0);
+            if (w <= 0) goto done_ch;
+            sent += w;
+        }
+    }
+done_ch:
+    pthread_mutex_lock(a->done_lock); *a->done = 1; pthread_mutex_unlock(a->done_lock);
+    free(a); return NULL;
+}
+
+// EXTRA 1: forward bytes from the internal socket back into the SSH channel
+void *bridge_sock_to_ch(void *arg) {
+    BridgeArgs *a = (BridgeArgs *)arg;
+    char buf[4096];
+    while (1) {
+        pthread_mutex_lock(a->done_lock);
+        int d = *a->done; pthread_mutex_unlock(a->done_lock);
+        if (d) break;
+
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(a->sockfd, &rfds);
+        struct timeval tv = {0, 200000};
+        if (select(a->sockfd + 1, &rfds, NULL, NULL, &tv) <= 0) continue;
+
+        int n = recv(a->sockfd, buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        if (ssh_channel_write(a->channel, buf, n) == SSH_ERROR) break;
+    }
+    pthread_mutex_lock(a->done_lock); *a->done = 1; pthread_mutex_unlock(a->done_lock);
+    free(a); return NULL;
+}
+
+// EXTRA 1: handle one SSH session: key exchange → auth → channel open → bridge
+typedef struct { ssh_session session; } SSHClientArgs;
+
+void *ssh_client_handler(void *arg) {
+    pthread_detach(pthread_self());
+    ssh_session session = ((SSHClientArgs *)arg)->session;
+    free(arg);
+
+    // EXTRA 1: SSH handshake
+    if (ssh_handle_key_exchange(session) != SSH_OK) {
+        fprintf(stderr, "SSH key exchange error: %s\n", ssh_get_error(session));
+        ssh_disconnect(session); ssh_free(session); return NULL;
+    }
+
+    // EXTRA 1: accept none or password auth (any password accepted)
+    ssh_set_auth_methods(session, SSH_AUTH_METHOD_NONE | SSH_AUTH_METHOD_PASSWORD);
+
+    ssh_channel channel = NULL;
+    int auth_ok = 0;
+
+    while (!channel) {
+        ssh_message msg = ssh_message_get(session);
+        if (!msg) break;
+
+        int mtype = ssh_message_type(msg);
+        int msub  = ssh_message_subtype(msg);
+
+        if (mtype == SSH_REQUEST_AUTH) {
+            if (msub == SSH_AUTH_METHOD_NONE ||
+                msub == SSH_AUTH_METHOD_PASSWORD) {
+                ssh_message_auth_reply_success(msg, 0);
+                auth_ok = 1;
+            } else {
+                ssh_message_reply_default(msg);
+            }
+        } else if (mtype == SSH_REQUEST_CHANNEL_OPEN && auth_ok) {
+            // EXTRA 1: accept direct-tcpip channel for port forwarding
+            if (msub == SSH_CHANNEL_DIRECT_TCPIP) {
+                channel = ssh_message_channel_request_open_reply_accept(msg);
+            } else {
+                ssh_message_reply_default(msg);
+            }
+        } else {
+            ssh_message_reply_default(msg);
+        }
+        ssh_message_free(msg);
+    }
+
+    if (!channel) {
+        ssh_disconnect(session); ssh_free(session); return NULL;
+    }
+
+    // EXTRA 1: connect to the internal chat listener and bridge
+    int isock = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in ia;
+    memset(&ia, 0, sizeof(ia));
+    ia.sin_family      = AF_INET;
+    ia.sin_addr.s_addr = inet_addr("127.0.0.1");
+    ia.sin_port        = htons(INTERNAL_PORT);
+
+    if (connect(isock, (struct sockaddr *)&ia, sizeof(ia)) < 0) {
+        ssh_channel_close(channel); ssh_channel_free(channel);
+        ssh_disconnect(session); ssh_free(session); close(isock); return NULL;
+    }
+
+    int done = 0;
+    pthread_mutex_t done_lock = PTHREAD_MUTEX_INITIALIZER;
+
+    BridgeArgs *a1 = malloc(sizeof(BridgeArgs));
+    a1->channel = channel; a1->sockfd = isock;
+    a1->done = &done; a1->done_lock = &done_lock;
+
+    BridgeArgs *a2 = malloc(sizeof(BridgeArgs));
+    a2->channel = channel; a2->sockfd = isock;
+    a2->done = &done; a2->done_lock = &done_lock;
+
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, bridge_ch_to_sock, a1);
+    pthread_create(&t2, NULL, bridge_sock_to_ch, a2);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+
+    close(isock);
+    ssh_channel_send_eof(channel);
+    ssh_channel_close(channel);
+    ssh_channel_free(channel);
+    ssh_disconnect(session);
+    ssh_free(session);
+    return NULL;
+}
+
+// EXTRA 1: generate RSA host key if not present
+void ensure_hostkey(void) {
+    if (access(HOSTKEY_PATH, F_OK) == 0) return;
+    printf("Generating SSH host key at %s ...\n", HOSTKEY_PATH);
+    char cmd[300];
+    snprintf(cmd, sizeof(cmd),
+             "ssh-keygen -t rsa -b 2048 -N '' -f %s >/dev/null 2>&1",
+             HOSTKEY_PATH);
+    if (system(cmd) != 0)
+        fprintf(stderr, "Warning: ssh-keygen failed; SSH tunnel may not work.\n");
+}
+
+/* main */
+int main(int argc, char *argv[]) {
+    (void)argc; (void)argv;
+
+    init_rooms();
+
+    // EXTRA 1: run the internal chat listener on a background thread
+    pthread_t internal_tid;
+    pthread_create(&internal_tid, NULL, internal_listener_thread, NULL);
+    pthread_detach(internal_tid);
+
+    // EXTRA 1: ensure RSA host key exists
+    ensure_hostkey();
+
+    // EXTRA 1: create and configure libssh bind
+    ssh_bind sshbind = ssh_bind_new();
+    int ssh_port = SSH_PORT;
+    ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_BINDPORT, &ssh_port);
+    ssh_bind_options_set(sshbind, SSH_BIND_OPTIONS_RSAKEY,   HOSTKEY_PATH);
+
+    if (ssh_bind_listen(sshbind) < 0) {
+        fprintf(stderr, "ssh_bind_listen failed: %s\n", ssh_get_error(sshbind));
+        return 1;
+    }
+
+    printf("SSH chat server listening on port %d\n", SSH_PORT);
+    printf("Clients connect with: ./main_client <server-ip>\n");
+
+    // EXTRA 1: accept SSH connections, one thread per client
+    while (1) {
+        ssh_session session = ssh_new();
+        if (!session) { fprintf(stderr, "ssh_new failed\n"); continue; }
+
+        if (ssh_bind_accept(sshbind, session) != SSH_OK) {
+            fprintf(stderr, "ssh_bind_accept: %s\n", ssh_get_error(sshbind));
+            ssh_free(session); continue;
+        }
+
+        SSHClientArgs *a = malloc(sizeof(SSHClientArgs));
+        a->session = session;
+        pthread_t tid;
+        pthread_create(&tid, NULL, ssh_client_handler, a);
+    }
+
+    ssh_bind_free(sshbind);
+    return 0;
+}
