@@ -10,21 +10,24 @@
 #include <libssh/libssh.h>
 #include <libssh/server.h>
 
+
 // ports
-#define SSH_PORT      2222   // EXTRA 1: clients SSH into this port
-#define INTERNAL_PORT 8081   // chat logic; bound to 127.0.0.1 only
+#define SSH_PORT       2222   // EXTRA 1: clients SSH into this port
+#define INTERNAL_PORT  8081   // chat logic; bound to 127.0.0.1 only
+#define FILE_BASE_PORT 9000   // EXTRA 2: ephemeral ports for file byte relay
 
 // limits
-#define MAX_ROOMS 10
+#define MAX_ROOMS      10
+#define MAX_PENDING_FT 16     // EXTRA 2: max concurrent in-flight file transfers
 
-// SSH host key (generated automatically on first run)
+// SSH host key path (generated automatically on first run)
 #define HOSTKEY_PATH "/tmp/chat_hostkey_rsa"
 
-/* Data structures */
 
 void error(const char *msg) { perror(msg); exit(1); }
 
-// One connected chat user
+
+// one connected chat user
 typedef struct _USR {
     int          clisockfd;
     char         user[64];
@@ -32,7 +35,7 @@ typedef struct _USR {
     struct _USR *next;
 } USR;
 
-// One chat room
+// one chat room
 typedef struct _ROOM {
     int             room_number;
     int             active;
@@ -44,7 +47,25 @@ ROOM rooms[MAX_ROOMS];
 int  next_room_number = 1;
 pthread_mutex_t rooms_lock = PTHREAD_MUTEX_INITIALIZER;
 
-/* Room management helpers */
+// EXTRA 2: one pending file transfer slot
+typedef struct _FT {
+    int  in_use;
+    int  ft_port;
+    char sender[64];
+    char receiver[64];
+    char filename[256];
+    long filesize;
+    int  sender_fd;
+    int  receiver_fd;
+    int  room_idx;
+} FT;
+
+FT ft_slots[MAX_PENDING_FT];
+pthread_mutex_t ft_lock = PTHREAD_MUTEX_INITIALIZER;
+int ft_next_port = FILE_BASE_PORT;
+
+
+// ── room management ──────────────────────────────────────────────────────────
 
 // C2: initialise rooms array
 void init_rooms(void) {
@@ -98,7 +119,7 @@ void room_add_client(int room_idx, int clisockfd, char *ip) {
     pthread_mutex_unlock(&rooms[room_idx].lock);
 }
 
-// C2: remove a client from a room; close room if empty 
+// C2: remove a client from a room; close room if empty
 void room_remove_client(int room_idx, int clisockfd) {
     pthread_mutex_lock(&rooms[room_idx].lock);
     USR *cur = rooms[room_idx].members, *prev = NULL;
@@ -118,15 +139,14 @@ void room_remove_client(int room_idx, int clisockfd) {
     pthread_mutex_unlock(&rooms[room_idx].lock);
 }
 
-// Print all connected clients to the server terminal
+// print all connected clients to the server terminal
 void print_client_list(void) {
     printf("Connected Clients:\n");
     int found = 0;
     for (int i = 0; i < MAX_ROOMS; i++) {
         if (rooms[i].active) {
             for (USR *cur = rooms[i].members; cur; cur = cur->next) {
-                printf(" [Room %d] %s (%s)\n",
-                       rooms[i].room_number, cur->user, cur->ip);
+                printf(" [Room %d] %s (%s)\n", rooms[i].room_number, cur->user, cur->ip);
                 found = 1;
             }
         }
@@ -162,11 +182,212 @@ void room_broadcast(int room_idx, int fromfd, char *message) {
     pthread_mutex_unlock(&rooms[room_idx].lock);
 }
 
-/* Per-client chat thread */
+// EXTRA 2: send a message directly to one named user in the room
+void send_to_user(int room_idx, const char *username, const char *msg) {
+    pthread_mutex_lock(&rooms[room_idx].lock);
+    for (USR *cur = rooms[room_idx].members; cur; cur = cur->next)
+        if (strcmp(cur->user, username) == 0) {
+            send(cur->clisockfd, msg, strlen(msg), 0);
+            break;
+        }
+    pthread_mutex_unlock(&rooms[room_idx].lock);
+}
+
+// EXTRA 2: return the socket fd for a named user in the room, or -1
+int fd_for_user(int room_idx, const char *username) {
+    pthread_mutex_lock(&rooms[room_idx].lock);
+    int fd = -1;
+    for (USR *cur = rooms[room_idx].members; cur; cur = cur->next)
+        if (strcmp(cur->user, username) == 0) { fd = cur->clisockfd; break; }
+    pthread_mutex_unlock(&rooms[room_idx].lock);
+    return fd;
+}
+
+
+// ── EXTRA 2: file transfer ───────────────────────────────────────────────────
+
+// allocate a transfer slot; returns index or -1 if full
+int ft_alloc(void) {
+    pthread_mutex_lock(&ft_lock);
+    for (int i = 0; i < MAX_PENDING_FT; i++) {
+        if (!ft_slots[i].in_use) {
+            ft_slots[i].in_use  = 1;
+            ft_slots[i].ft_port = ft_next_port++;
+            pthread_mutex_unlock(&ft_lock);
+            return i;
+        }
+    }
+    pthread_mutex_unlock(&ft_lock);
+    return -1;
+}
+
+void ft_free(int idx) {
+    pthread_mutex_lock(&ft_lock);
+    ft_slots[idx].in_use = 0;
+    pthread_mutex_unlock(&ft_lock);
+}
+
+// EXTRA 2: async relay thread — opens an ephemeral TCP port, accepts sender
+// and receiver, pipes bytes between them, then notifies both when done.
+// Runs in its own detached thread so chat is never blocked.
+typedef struct { int ft_idx; } FTRelayArgs;
+
+void *ft_relay_thread(void *arg) {
+    pthread_detach(pthread_self());
+    int idx = ((FTRelayArgs *)arg)->ft_idx;
+    free(arg);
+
+    FT *ft   = &ft_slots[idx];
+    int port = ft->ft_port;
+
+    // bind a temporary listen socket for the raw file bytes
+    int lsock = socket(AF_INET, SOCK_STREAM, 0);
+    if (lsock < 0) { ft_free(idx); return NULL; }
+    int opt = 1;
+    setsockopt(lsock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in la;
+    memset(&la, 0, sizeof(la));
+    la.sin_family      = AF_INET;
+    la.sin_addr.s_addr = INADDR_ANY;
+    la.sin_port        = htons(port);
+
+    if (bind(lsock, (struct sockaddr *)&la, sizeof(la)) < 0 || listen(lsock, 2) < 0) {
+        close(lsock); ft_free(idx); return NULL;
+    }
+
+    // EXTRA 2: tell both parties which port to connect to for the raw transfer
+    char port_msg[64];
+    snprintf(port_msg, sizeof(port_msg), "FILE_PORT %d\n", port);
+    send(ft->sender_fd,   port_msg, strlen(port_msg), 0);
+    send(ft->receiver_fd, port_msg, strlen(port_msg), 0);
+
+    // accept sender and receiver connections (30 s timeout each)
+    int conn[2] = {-1, -1};
+    for (int i = 0; i < 2; i++) {
+        fd_set rfds; FD_ZERO(&rfds); FD_SET(lsock, &rfds);
+        struct timeval tv = {30, 0};
+        if (select(lsock + 1, &rfds, NULL, NULL, &tv) <= 0) break;
+        struct sockaddr_in ca; socklen_t cl = sizeof(ca);
+        conn[i] = accept(lsock, (struct sockaddr *)&ca, &cl);
+    }
+    close(lsock);
+
+    // EXTRA 2: abort gracefully if one party never connected
+    if (conn[0] < 0 || conn[1] < 0) {
+        char ab[] = "FILE_ABORT Transfer aborted: peer did not connect.\n";
+        if (conn[0] >= 0) { send(ft->sender_fd,   ab, strlen(ab), 0); close(conn[0]); }
+        if (conn[1] >= 0) { send(ft->receiver_fd, ab, strlen(ab), 0); close(conn[1]); }
+        ft_free(idx); return NULL;
+    }
+
+    // relay bytes: conn[0] = sender, conn[1] = receiver
+    char buf[8192];
+    long total = ft->filesize, received = 0;
+    int n;
+    while (received < total) {
+        n = recv(conn[0], buf, sizeof(buf), 0);
+        if (n <= 0) break;
+        int sent = 0;
+        while (sent < n) {
+            int w = send(conn[1], buf + sent, n - sent, 0);
+            if (w <= 0) goto relay_done;
+            sent += w;
+        }
+        received += n;
+    }
+relay_done:
+    close(conn[0]);
+    close(conn[1]);
+
+    // EXTRA 2: notify only sender and receiver — rest of room never sees this
+    char done[512];
+    snprintf(done, sizeof(done),
+             "FILE_DONE Transfer of '%s' complete (%ld/%ld bytes).\n",
+             ft->filename, received, total);
+    send(ft->sender_fd,   done, strlen(done), 0);
+    send(ft->receiver_fd, done, strlen(done), 0);
+
+    ft_free(idx);
+    return NULL;
+}
+
+// EXTRA 2: handle "FILE_SEND <receiver> <filename> <size>" from a sender
+void handle_file_send(int room_idx, int sender_fd, const char *sender_name, char *payload) {
+    char receiver[64] = {0}, filename[256] = {0};
+    long filesize = 0;
+
+    if (sscanf(payload, "%63s %255s %ld", receiver, filename, &filesize) != 3) {
+        char e[] = "FILE_ERROR Bad FILE_SEND format.\n";
+        send(sender_fd, e, strlen(e), 0); return;
+    }
+    if (strcmp(receiver, sender_name) == 0) {
+        char e[] = "FILE_ERROR Cannot send a file to yourself.\n";
+        send(sender_fd, e, strlen(e), 0); return;
+    }
+
+    int rfd = fd_for_user(room_idx, receiver);
+    if (rfd < 0) {
+        char e[] = "FILE_ERROR Receiver not found in this room.\n";
+        send(sender_fd, e, strlen(e), 0); return;
+    }
+
+    int idx = ft_alloc();
+    if (idx < 0) {
+        char e[] = "FILE_ERROR Server busy; try again later.\n";
+        send(sender_fd, e, strlen(e), 0); return;
+    }
+
+    strncpy(ft_slots[idx].sender,   sender_name, 64);
+    strncpy(ft_slots[idx].receiver, receiver,    64);
+    strncpy(ft_slots[idx].filename, filename,    256);
+    ft_slots[idx].filesize    = filesize;
+    ft_slots[idx].sender_fd   = sender_fd;
+    ft_slots[idx].receiver_fd = rfd;
+    ft_slots[idx].room_idx    = room_idx;
+
+    // EXTRA 2: offer goes only to the receiver — room-isolated
+    char offer[400];
+    snprintf(offer, sizeof(offer), "FILE_OFFER %s %s %ld\n", sender_name, filename, filesize);
+    send(rfd, offer, strlen(offer), 0);
+
+    char wait[] = "FILE_WAIT Waiting for receiver to accept...\n";
+    send(sender_fd, wait, strlen(wait), 0);
+}
+
+// EXTRA 2: handle FILE_ACCEPT or FILE_REJECT from the receiver
+void handle_file_response(int room_idx, int receiver_fd, int accepted) {
+    pthread_mutex_lock(&ft_lock);
+    int idx = -1;
+    for (int i = 0; i < MAX_PENDING_FT; i++) {
+        if (ft_slots[i].in_use &&
+            ft_slots[i].receiver_fd == receiver_fd &&
+            ft_slots[i].room_idx   == room_idx) {
+            idx = i; break;
+        }
+    }
+    pthread_mutex_unlock(&ft_lock);
+    if (idx < 0) return;
+
+    if (!accepted) {
+        char rej[] = "FILE_REJECTED Receiver declined the transfer.\n";
+        send(ft_slots[idx].sender_fd, rej, strlen(rej), 0);
+        ft_free(idx); return;
+    }
+
+    // EXTRA 2: start the async relay thread so chat is not blocked
+    FTRelayArgs *a = malloc(sizeof(FTRelayArgs));
+    a->ft_idx = idx;
+    pthread_t tid;
+    pthread_create(&tid, NULL, ft_relay_thread, a);
+}
+
+
+// ── per-client chat thread ───────────────────────────────────────────────────
 
 typedef struct _ThreadArgs {
     int clisockfd;
-    int room_idx;   /* C2 */
+    int room_idx;   // C2
 } ThreadArgs;
 
 void *thread_main(void *args) {
@@ -183,7 +404,7 @@ void *thread_main(void *args) {
     char ip[32];
     strncpy(ip, inet_ntoa(cliaddr.sin_addr), 32);
 
-    room_add_client(room_idx, clisockfd, ip);  /* C2 */
+    room_add_client(room_idx, clisockfd, ip);  // C2
 
     // Req 3: first recv is the username
     char username[64] = {0};
@@ -201,26 +422,36 @@ void *thread_main(void *args) {
 
     // Req 4: broadcast join notification
     char join_msg[128];
-    snprintf(join_msg, sizeof(join_msg),
-             "%s (%s) joined the chat room!\n", username, ip);
+    snprintf(join_msg, sizeof(join_msg), "%s (%s) joined the chat room!\n", username, ip);
     room_broadcast(room_idx, clisockfd, join_msg);
 
-    // main recv / broadcast loop
-    char buffer[256];
-    char formatted[400];
+    // main recv / dispatch loop
+    char buffer[512];
+    char formatted[700];
 
-    while ((nrcv = recv(clisockfd, buffer, 255, 0)) > 0) {
+    while ((nrcv = recv(clisockfd, buffer, 511, 0)) > 0) {
         buffer[nrcv] = '\0';
-        snprintf(formatted, sizeof(formatted),
-                 "[%s (%s)] %s\n", username, ip, buffer);
-        room_broadcast(room_idx, clisockfd, formatted);
+        int blen = strlen(buffer);
+        if (blen > 0 && buffer[blen-1] == '\n') buffer[--blen] = '\0';
+
+        // EXTRA 2: intercept file-transfer protocol messages
+        if (strncmp(buffer, "FILE_SEND ", 10) == 0) {
+            handle_file_send(room_idx, clisockfd, username, buffer + 10);
+        } else if (strcmp(buffer, "FILE_ACCEPT") == 0) {
+            handle_file_response(room_idx, clisockfd, 1);
+        } else if (strcmp(buffer, "FILE_REJECT") == 0) {
+            handle_file_response(room_idx, clisockfd, 0);
+        } else {
+            // normal chat message
+            snprintf(formatted, sizeof(formatted), "[%s (%s)] %s\n", username, ip, buffer);
+            room_broadcast(room_idx, clisockfd, formatted);
+        }
         memset(buffer, 0, sizeof(buffer));
     }
 
     // Req 4: broadcast leave notification
     char leave_msg[128];
-    snprintf(leave_msg, sizeof(leave_msg),
-             "%s (%s) left the room!\n", username, ip);
+    snprintf(leave_msg, sizeof(leave_msg), "%s (%s) left the room!\n", username, ip);
     room_broadcast(room_idx, clisockfd, leave_msg);
 
     room_remove_client(room_idx, clisockfd);
@@ -229,8 +460,9 @@ void *thread_main(void *args) {
     return NULL;
 }
 
-/* Internal chat listener (127.0.0.1:INTERNAL_PORT) */
-/* Accepts TCP connections forwarded from the SSH channel bridge. */
+
+// ── internal chat listener (127.0.0.1:INTERNAL_PORT) ────────────────────────
+// accepts TCP connections forwarded from the SSH channel bridge
 
 // C2/C3: room negotiation on a freshly-accepted internal socket
 void handle_room_negotiation(int newsockfd) {
@@ -250,7 +482,7 @@ void handle_room_negotiation(int newsockfd) {
         printf("Created room %d\n", rooms[room_idx].room_number);
 
     } else if (strcmp(room_req, "list") == 0) {
-        // C3: send list or auto-create
+        // C3: send room list or auto-create if none exist
         int any = 0;
         for (int i = 0; i < MAX_ROOMS; i++) if (rooms[i].active) { any = 1; break; }
 
@@ -334,7 +566,13 @@ void *internal_listener_thread(void *arg) {
     return NULL;
 }
 
-/* EXTRA 1 – libssh server: SSH channel bridge */
+
+// ── EXTRA 1: libssh server bridge ───────────────────────────────────────────
+// each SSH client opens a direct-tcpip channel; we splice it to a real TCP
+// socket on 127.0.0.1:INTERNAL_PORT using two threads:
+//   bridge_ch_to_sock: SSH channel → socket
+//   bridge_sock_to_ch: socket → SSH channel
+
 typedef struct {
     ssh_channel      channel;
     int              sockfd;
@@ -416,8 +654,7 @@ void *ssh_client_handler(void *arg) {
         int msub  = ssh_message_subtype(msg);
 
         if (mtype == SSH_REQUEST_AUTH) {
-            if (msub == SSH_AUTH_METHOD_NONE ||
-                msub == SSH_AUTH_METHOD_PASSWORD) {
+            if (msub == SSH_AUTH_METHOD_NONE || msub == SSH_AUTH_METHOD_PASSWORD) {
                 ssh_message_auth_reply_success(msg, 0);
                 auth_ok = 1;
             } else {
@@ -485,17 +722,19 @@ void ensure_hostkey(void) {
     printf("Generating SSH host key at %s ...\n", HOSTKEY_PATH);
     char cmd[300];
     snprintf(cmd, sizeof(cmd),
-             "ssh-keygen -t rsa -b 2048 -N '' -f %s >/dev/null 2>&1",
-             HOSTKEY_PATH);
+             "ssh-keygen -t rsa -b 2048 -N '' -f %s >/dev/null 2>&1", HOSTKEY_PATH);
     if (system(cmd) != 0)
         fprintf(stderr, "Warning: ssh-keygen failed; SSH tunnel may not work.\n");
 }
 
-/* main */
+
+// ── main ─────────────────────────────────────────────────────────────────────
+
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
     init_rooms();
+    memset(ft_slots, 0, sizeof(ft_slots));  // EXTRA 2: clear transfer slots
 
     // EXTRA 1: run the internal chat listener on a background thread
     pthread_t internal_tid;
