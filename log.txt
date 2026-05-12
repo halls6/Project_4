@@ -1,0 +1,19 @@
+eac7a83 EX2 type
+ed583ba EX1 actual
+5ae7b4f EX1
+7a31c5f So i can use the VM
+bfcac2b make clean
+d059e93 essay.pdf added
+8883605 typo fixed in main_server.c
+1c606ba Checkpoint 3 working.
+cf27454 checkpoint 2 complete
+2eb650b 4 and 5 now working on my end
+c99b4eb accepted changes, nicks 4 and 5
+aefe30f requirement 3 working
+b723904 Complete Checkpoint 1: all 5 requirements done
+b8b2062 Fully implementing Req 3 and 4: usernames + join/leave notifs
+49d8f83 checkpoint 1 req 2 working, broadcasting messages between clients.
+53cb84f added pdf files
+6e87b49 checkpoint 1, requirement 1: server displays up to date list of connect clients.
+3ee9147 adding in files from zip
+b8c8078 Initial commit
